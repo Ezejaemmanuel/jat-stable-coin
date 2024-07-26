@@ -33,7 +33,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
     error JatEngine__AllowanceNotEqualToAmountToDeposit();
     error UserAddressInvalid(address user);
     error BalanceRetrievalFailed(address user, address tokenAddress);
-    error YouCannotLiquidateYourself();
 
     JatStableCoin jatStableCoin;
     mapping(address => address) private collateralAddressToPriceFeedAddress;
@@ -46,7 +45,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
 
     struct BorrowDetails {
         uint256 id;
-        address user;
         address collateralAddress;
         uint256 amountOfJatCoinBorrowed;
         uint256 borrowTime;
@@ -60,36 +58,31 @@ contract JatEngine is ReentrancyGuard, Ownable {
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant PRECISION = 1e18;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    // uint256 private constant SECONDS_IN_A_YEAR = 365;
+    // uint256 private constant SECONDS_IN_A_YEAR = 365 * 24 * 60 * 60;
 
     uint256 constant COMPOUNDING_PERIODS_PER_YEAR = 1;
     uint96 public constant UINT96_MAX = type(uint96).max;
     bool public isTestMode = true;
     uint256 private interestRate;
 
-    enum TransactionType {
-        BorrowedJatCoin,
-        CollateralDeposited,
-        JatCoinRepaid,
-        Liquidation
-    }
+    event JatCoinMinted(
+        address indexed borrower, uint256 indexed borrowId, uint256 amount, address collateralAddress, uint256 timestamp
+    );
 
-    address[] private usersThatBorrowed;
+    event CollateralDeposited(address indexed user, address collateralAddress, uint256 amount, uint256 timestamp);
 
-    struct UserHealthFactor {
-        address user;
-        uint256 healthFactor;
-    }
+    event JatCoinRepaid(
+        address indexed user, uint256 indexed borrowId, uint256 amount, address collateralAddress, uint256 timestamp
+    );
 
-    struct TransactionData {
-        uint256 borrowId;
-        uint256 amount;
-        address collateralAddress;
-        uint256 collateralSeized;
-        address liquidator;
-    }
-
-    event TransactionHistory(
-        address indexed user, uint256 timestamp, TransactionData data, TransactionType indexed transactionType
+    event Liquidation(
+        address indexed borrower,
+        uint256 indexed borrowId,
+        uint256 repayAmount,
+        uint256 collateralSeized,
+        address indexed liquidator,
+        uint256 timestamp
     );
 
     modifier NumberMustBeMoreThanZero(uint256 amount) {
@@ -128,33 +121,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
         isTestMode = _isTestMode;
     }
 
-    function addUser(address user) internal {
-        for (uint256 i = 0; i < usersThatBorrowed.length; i++) {
-            if (usersThatBorrowed[i] == user) {
-                return; // User already exists
-            }
-        }
-        usersThatBorrowed.push(user);
-    }
-
-    function removeUserIfNoDebt(address user) internal {
-        uint256 borrowCount = userBorrowCount[user];
-        for (uint256 i = 1; i <= borrowCount; i++) {
-            if (userBorrowDetails[user][i].amountOfJatCoinBorrowed > 0) {
-                return; // User still has outstanding debt
-            }
-        }
-
-        // Remove user from the array
-        for (uint256 i = 0; i < usersThatBorrowed.length; i++) {
-            if (usersThatBorrowed[i] == user) {
-                usersThatBorrowed[i] = usersThatBorrowed[usersThatBorrowed.length - 1];
-                usersThatBorrowed.pop();
-                return;
-            }
-        }
-    }
-
     function depositAndBorrow(address _collateralAddress, uint256 _amountToDeposit, uint256 _amountOfJatCoinToBorrow)
         public
         IsAllowedCollateralAddress(_collateralAddress)
@@ -180,18 +146,7 @@ contract JatEngine is ReentrancyGuard, Ownable {
             revert JatEngine__AllowanceNotEqualToAmountToDeposit();
         }
 
-        emit TransactionHistory(
-            _addressOfWhoIsDepositing,
-            block.timestamp,
-            TransactionData({
-                borrowId: 0,
-                amount: _amountToDeposit,
-                collateralAddress: _collateralAddress,
-                collateralSeized: 0,
-                liquidator: address(0)
-            }),
-            TransactionType.CollateralDeposited
-        );
+        emit CollateralDeposited(_addressOfWhoIsDepositing, _collateralAddress, _amountToDeposit, block.timestamp);
 
         bool success =
             IERC20(_collateralAddress).transferFrom(_addressOfWhoIsDepositing, address(this), _amountToDeposit);
@@ -208,7 +163,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
         nonReentrant
         NumberMustBeMoreThanZero(_amountOfJatCoinToBorrow)
     {
-        addUser(msg.sender);
         _mintJatCoin(_amountOfJatCoinToBorrow, _collateralAddress);
     }
 
@@ -218,26 +172,13 @@ contract JatEngine is ReentrancyGuard, Ownable {
 
         BorrowDetails memory borrowDetails = BorrowDetails({
             id: borrowId,
-            user: msg.sender,
             collateralAddress: _collateralAddress,
             amountOfJatCoinBorrowed: _amountOfJatCoinToMint,
             borrowTime: block.timestamp
         });
         userBorrowDetails[msg.sender][borrowId] = borrowDetails;
 
-        emit TransactionHistory(
-            msg.sender,
-            block.timestamp,
-            TransactionData({
-                borrowId: borrowId,
-                amount: _amountOfJatCoinToMint,
-                collateralAddress: _collateralAddress,
-                collateralSeized: 0,
-                liquidator: address(0)
-            }),
-            TransactionType.BorrowedJatCoin
-        );
-
+        emit JatCoinMinted(msg.sender, borrowId, _amountOfJatCoinToMint, _collateralAddress, block.timestamp);
         _ensureHealthFactorIsNotBroken(msg.sender);
         bool success = jatStableCoin.mint(msg.sender, _amountOfJatCoinToMint);
         if (!success) {
@@ -272,7 +213,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
 
         if (amountInUsdAndJat == totalDebtWithInterest) {
             borrowDetails.amountOfJatCoinBorrowed = 0;
-            removeUserIfNoDebt(msg.sender);
         } else {
             borrowDetails.amountOfJatCoinBorrowed = totalDebtWithInterest - amountInUsdAndJat;
         }
@@ -288,24 +228,10 @@ contract JatEngine is ReentrancyGuard, Ownable {
         jatStableCoin.burn(amountInUsdAndJat);
         jatStableCoin.approve(address(this), 0);
 
-        emit TransactionHistory(
-            msg.sender,
-            block.timestamp,
-            TransactionData({
-                borrowId: borrowId,
-                amount: amountInUsdAndJat,
-                collateralAddress: collateralAddress,
-                collateralSeized: 0,
-                liquidator: address(0)
-            }),
-            TransactionType.JatCoinRepaid
-        );
+        emit JatCoinRepaid(msg.sender, borrowId, amountInUsdAndJat, collateralAddress, block.timestamp);
     }
 
     function liquidate(address borrower, uint256 borrowId, uint256 repayAmount) public nonReentrant {
-        if (borrower == msg.sender) {
-            revert YouCannotLiquidateYourself();
-        }
         uint256 healthFactor = _getHealthFactor(borrower);
         if (healthFactor >= MIN_HEALTH_FACTOR) {
             revert HealthFactorNotBelowThreshold(healthFactor);
@@ -332,9 +258,7 @@ contract JatEngine is ReentrancyGuard, Ownable {
 
         borrowDetails.amountOfJatCoinBorrowed -= repayAmount;
         userToCollateralAdressToAmount[borrower][collateralAddress] -= collateralAmountToSeize;
-        if (borrowDetails.amountOfJatCoinBorrowed == 0) {
-            removeUserIfNoDebt(borrower); // Remove user if they no longer owe any debt across all borrow details
-        }
+
         bool collateralTransferSuccess = IERC20(collateralAddress).transfer(msg.sender, collateralAmountToSeize);
         if (!collateralTransferSuccess) {
             revert CollateralTransferFailed();
@@ -346,11 +270,8 @@ contract JatEngine is ReentrancyGuard, Ownable {
         }
 
         jatStableCoin.burn(repayAmount);
-        _ensureHealthFactorIsNotBroken(msg.sender);
-        jatStableCoin.approve(address(this), 0);
-        _emitTransactionHistory(
-            borrower, borrowId, repayAmount, borrowDetails.collateralAddress, collateralAmountToSeize
-        );
+
+        emit Liquidation(borrower, borrowId, repayAmount, collateralAmountToSeize, msg.sender, block.timestamp);
     }
 
     function _ensureHealthFactorIsNotBroken(address user) private view {
@@ -358,27 +279,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
         if (healthFactor < MIN_HEALTH_FACTOR) {
             revert JatEngine__HealthFactorIsNotMaintained();
         }
-    }
-
-    function _emitTransactionHistory(
-        address borrower,
-        uint256 borrowId,
-        uint256 repayAmount,
-        address collateralAddress,
-        uint256 collateralAmountToSeize
-    ) internal {
-        emit TransactionHistory(
-            borrower,
-            block.timestamp,
-            TransactionData({
-                borrowId: borrowId,
-                amount: repayAmount,
-                collateralAddress: collateralAddress,
-                collateralSeized: collateralAmountToSeize,
-                liquidator: msg.sender
-            }),
-            TransactionType.Liquidation
-        );
     }
 
     function _getHealthFactor(address user) private view returns (uint256) {
@@ -527,28 +427,6 @@ contract JatEngine is ReentrancyGuard, Ownable {
     }
 
     // Getter functions
-
-    function getUsersWithHealthFactorBelowOne() external view returns (UserHealthFactor[] memory) {
-        UserHealthFactor[] memory tempArray = new UserHealthFactor[](usersThatBorrowed.length);
-        uint256 count = 0;
-
-        for (uint256 i = 0; i < usersThatBorrowed.length; i++) {
-            uint256 healthFactor = _getHealthFactor(usersThatBorrowed[i]);
-            if (healthFactor < MIN_HEALTH_FACTOR) {
-                tempArray[count] = UserHealthFactor({user: usersThatBorrowed[i], healthFactor: healthFactor});
-                count++;
-            }
-        }
-
-        // Create a fixed-size array with the exact count of users with health factor below 1
-        UserHealthFactor[] memory userHealthFactors = new UserHealthFactor[](count);
-        for (uint256 i = 0; i < count; i++) {
-            userHealthFactors[i] = tempArray[i];
-        }
-
-        return userHealthFactors;
-    }
-
     function setUserCollateralAmount(address _user, address _collateralAddress, uint256 _amount) public {
         userToCollateralAdressToAmount[_user][_collateralAddress] = _amount;
     }

@@ -6,9 +6,12 @@ out = "out"
 ramappings = [
   "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
   " @chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/src/",
-  "@prb/math/=lib/prb-math/s"
+  "@prb/math/=lib/prb-math/s",
 ]
 src = "src"
+
+fs_permissions = [{access = "read", path = "./images/"}, {access = "read", path = "./broadcast"}]
+
 # viaIR = true
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
